@@ -1,0 +1,86 @@
+# ============================================================
+# SH-WFS Pipeline — Sensor & System Configuration
+# ============================================================
+# All physical units are SI (meters, seconds, radians) unless noted.
+# Pixel units are always in detector pixels.
+
+# ── Camera ──────────────────────────────────────────────────
+camera:
+  pixel_size: 5.5e-6          # [m] physical pixel pitch
+  bit_depth: 12               # ADU bit depth (8 or 16 common)
+  read_noise_e: 3.0           # [e-] RMS read noise
+  dark_current_e_per_s: 0.1   # [e-/s] dark current
+  gain: 1.0                   # [e-/ADU] camera gain
+  frame_interval: 2.0e-3      # [s] time between frames (500 Hz)
+  resolution: [128, 128]      # [px] full detector [width, height]
+
+# ── Microlens Array ─────────────────────────────────────────
+mla:
+  n_sa_x: 8                   # number of sub-apertures in x
+  n_sa_y: 8                   # number of sub-apertures in y
+  lenslet_size: 300.0e-6      # [m] physical lenslet pitch (= sub-aperture diameter)
+  focal_length: 6.2e-3        # [m] lenslet focal length
+  pixels_per_sa: 16           # [px] pixels allocated per sub-aperture (must match resolution/n_sa)
+  # Note: resolution must equal [n_sa_x * pixels_per_sa, n_sa_y * pixels_per_sa]
+
+# ── Telescope / Beam ─────────────────────────────────────────
+telescope:
+  aperture_diameter: 6.0e-3   # [m] pupil diameter of turbulated beam
+  central_obscuration: 0.0    # [fraction] 0 = unobscured
+  wavelength: 633.0e-9        # [m] sensing wavelength (HeNe default)
+
+# ── Pupil Definition (in pixels on detector) ─────────────────
+pupil:
+  # These are derived from mla + camera, but can be overridden.
+  # Center is in pixel coordinates relative to (0,0) top-left.
+  center_x: 63.5              # [px] pupil center x (0-indexed)
+  center_y: 63.5              # [px] pupil center y (0-indexed)
+  radius_px: 58.0             # [px] pupil radius on detector
+  # Sub-apertures whose center falls outside this radius are masked.
+
+# ── Centroiding ──────────────────────────────────────────────
+centroiding:
+  algorithm: "threshold_cog"  # Options: "cog" | "threshold_cog" | "windowed_cog"
+  threshold_sigma: 3.0        # T-CoG: threshold = bg_mean + sigma * bg_std
+  window_sigma_px: 2.5        # W-CoG: Gaussian window half-width in pixels
+  min_flux_threshold: 50.0    # Minimum sub-aperture flux (ADU) to consider valid
+  border_px: 2                # Border pixels used for background estimation
+
+# ── Reference Centroids ──────────────────────────────────────
+reference:
+  method: "geometric"         # Options: "geometric" | "flat_frame" | "time_average"
+  flat_frame_path: null       # Path to flat wavefront BMP (if method=flat_frame)
+  n_frames_average: 20        # Number of frames to average (if method=time_average)
+
+# ── Deformable Mirror ─────────────────────────────────────────
+dm:
+  n_actuators_x: 9            # Fried: n_sa_x + 1
+  n_actuators_y: 9            # Fried: n_sa_y + 1
+  actuator_pitch: 300.0e-6    # [m] actuator spacing (= lenslet pitch in Fried geometry)
+  max_stroke: 3.0e-6          # [m] maximum actuator stroke (±1.5 µm)
+  coupling_coefficient: 0.15  # Inter-actuator coupling (0=none, ~0.1-0.3 typical)
+  influence_function: "gaussian"  # "gaussian" | "measured" (from file)
+  influence_sigma: 0.4        # [fraction of pitch] Gaussian IF width
+
+# ── Wavefront Reconstruction ──────────────────────────────────
+reconstruction:
+  method: "modal_zernike"     # Options: "modal_zernike" | "zonal_fried"
+  n_zernike_modes: 21         # Number of Zernike modes (j=1..21, j=1 piston excluded)
+  svd_threshold: 1e-3         # Fraction of max singular value for SVD truncation
+  tikhonov_gamma: 1e-4        # Regularisation for zonal reconstruction
+
+# ── Turbulence Simulation (for synthetic data generator) ──────
+turbulence:
+  r0: 0.00002                    # [m] Fried parameter at sensing wavelength
+  L0: 10.0                    # [m] outer scale (von Kármán)
+  l0: 1.0e-3                  # [m] inner scale
+  wind_speed: 0.001             # [m/s] effective wind speed
+  wind_direction_deg: 30.0    # [deg] wind direction (0=+x)
+  photons_per_sa: 1000        # Mean photons per sub-aperture per frame
+
+# ── Synthetic Data Output ──────────────────────────────────────
+synthetic:
+  n_frames: 100               # Number of frames to generate
+  output_dir: "outputs/frames"
+  screen_size_factor: 4       # Phase screen larger than aperture by this factor
+  random_seed: 42
