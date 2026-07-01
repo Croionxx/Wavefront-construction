@@ -81,7 +81,7 @@ def plot_slope_structure_fn(tr, save_path: Optional[str] = None):
 
     ax.set_xlabel("Separation r [m]")
     ax.set_ylabel("$D_\\phi(r)$ [rad$^2$]")
-    ax.set_title("Spatial Slope Structure Function")
+    ax.set_title("Spatial Phase Structure Function (from Stage 2 phase maps)")
     ax.legend(fontsize=8, facecolor=PANEL_BG, labelcolor="white")
     fig.tight_layout()
     _save(fig, save_path)
