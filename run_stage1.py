@@ -21,6 +21,29 @@ Optional flags:
     --no-generate  skip frame generation (use existing outputs/frames/)
     --c-backend  force C centroiding backend
     --n-frames   override number of frames to process
+
+────────────────────────────────────────────────────────────────────────
+FIXES vs the original version (see accompanying explanation):
+
+1. `step3_benchmark` previously measured "accuracy" as RMS distance from
+   the *geometric* sub-aperture centre. Since turbulence genuinely moves
+   spots away from that centre, a more accurate algorithm reported a
+   *larger* number — inverting the ranking. It now compares against the
+   truth-derived expected centroid position (reference + the spot
+   displacement implied by sx_truth/sy_truth via the same optical
+   formula used by the synthetic generator), which is the actual
+   ground truth.
+
+2. `_plot_truth_comparison` previously converted sx_truth/sy_truth
+   (rad/m, i.e. d(phase)/dx) into the same units as the measured slope
+   using `sx_truth_2d * lenslet_size`. That is dimensionally wrong: the
+   correct optical conversion (matching what render_shwfs_frame() and
+   SlopeComputer jointly implement) is `sx_truth_2d * wavelength/(2*pi)`.
+   lenslet_size and wavelength/(2*pi) differ by ~3000x for this sensor,
+   which is exactly the scale mismatch seen in the truth-comparison plot.
+   The centroiding + slope pipeline itself was already correct — only
+   this validation/plotting step had the wrong constant.
+────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -66,6 +89,7 @@ def resolve_params(config: dict) -> dict:
     mla = config["mla"]
     pup = config["pupil"]
     cen = config["centroiding"]
+    tel = config["telescope"]
     return dict(
         # Camera
         pixel_size      = cam["pixel_size"],
@@ -77,6 +101,9 @@ def resolve_params(config: dict) -> dict:
         pix_per_sa      = mla["pixels_per_sa"],
         focal_length    = mla["focal_length"],
         lenslet_size    = mla["lenslet_size"],
+        # Telescope / optics
+        wavelength      = tel["wavelength"],
+        aperture_diameter = tel["aperture_diameter"],
         # Pupil
         pupil_cx        = pup["center_x"],
         pupil_cy        = pup["center_y"],
@@ -134,10 +161,18 @@ def step2_build_grid(params: dict):
 def step3_benchmark(frames: np.ndarray,
                     grid,
                     params: dict,
-                    out_dir: Path) -> dict:
+                    out_dir: Path,
+                    truth: dict) -> dict:
     """
     Benchmark all three centroiding algorithms on a subset of frames.
     Returns timing and accuracy measurements.
+
+    Accuracy is measured against the TRUTH-DERIVED expected centroid
+    position (geometric reference + the pixel displacement implied by
+    the synthetic sx_truth/sy_truth slopes), NOT the bare geometric
+    reference — turbulence genuinely displaces spots away from the
+    geometric centre, so comparing against the geometric centre alone
+    penalises accurate algorithms.
     """
     log.info("━" * 60)
     log.info("STEP 3 — Centroiding algorithm benchmark")
@@ -166,6 +201,25 @@ def step3_benchmark(frames: np.ndarray,
     ref_cx = grid.cx_ref
     ref_cy = grid.cy_ref
 
+    # ── Truth-derived expected centroid positions for the bench frames ──────
+    # Same optical conversion used by generate_turbulence.render_shwfs_frame():
+    #   dpix = f * (wavelength / 2*pi) * sx_truth[rad/m] / pixel_size
+    have_truth = "sx_truth" in truth and "sy_truth" in truth
+    if have_truth:
+        conv = (params["focal_length"] * (params["wavelength"] / (2.0 * np.pi))
+                / params["pixel_size"])
+        n_sa_y, n_sa_x = params["n_sa_y"], params["n_sa_x"]
+        sx_truth_bench = np.asarray(truth["sx_truth"])[:n_bench].reshape(n_bench, -1)
+        sy_truth_bench = np.asarray(truth["sy_truth"])[:n_bench].reshape(n_bench, -1)
+        expected_cx = ref_cx[np.newaxis, :] + conv * sx_truth_bench
+        expected_cy = ref_cy[np.newaxis, :] + conv * sy_truth_bench
+    else:
+        log.warning("No truth data available — falling back to geometric "
+                    "reference for the benchmark (accuracy numbers will be "
+                    "biased, see docstring).")
+        expected_cx = np.broadcast_to(ref_cx, (n_bench, ref_cx.shape[0]))
+        expected_cy = np.broadcast_to(ref_cy, (n_bench, ref_cy.shape[0]))
+
     for name, method in algorithms.items():
         # Try C backend, fall back to Python
         try:
@@ -188,9 +242,11 @@ def step3_benchmark(frames: np.ndarray,
         elapsed_ms  = (t1 - t0) * 1e3
         per_frame   = elapsed_ms / n_bench
 
-        # Accuracy: RMS displacement from reference for valid sub-apertures
+        # Accuracy: RMS displacement from the TRUTH-derived expected
+        # centroid, for valid sub-apertures only.
         v = grid.valid
-        disp = np.hypot(cx_arr[:, v] - ref_cx[v], cy_arr[:, v] - ref_cy[v])
+        disp = np.hypot(cx_arr[:, v] - expected_cx[:, v],
+                        cy_arr[:, v] - expected_cy[:, v])
         rms_disp = float(np.sqrt(np.mean(disp**2)))
 
         bench_results[name] = {
@@ -199,7 +255,7 @@ def step3_benchmark(frames: np.ndarray,
         }
         all_centroids[name] = (cx_arr, cy_arr)
 
-        log.info("  %-15s: %.2f ms/frame  |  RMS disp = %.3f px",
+        log.info("  %-15s: %.2f ms/frame  |  RMS error vs truth = %.3f px",
                  name, per_frame, rms_disp)
 
     # Plot benchmark
@@ -344,7 +400,8 @@ def step6_visualise(frames:          np.ndarray,
 
     # ── 6. Truth comparison if available ────────────────────────────────────
     if "sx_truth" in truth:
-        _plot_truth_comparison(truth, sr, sc, grid, fi, out_dir)
+        _plot_truth_comparison(truth, sr, sc, grid, fi, out_dir,
+                               wavelength=params["wavelength"])
 
     log.info("✓ All plots saved to %s", out_dir)
 
@@ -354,11 +411,12 @@ def _plot_truth_comparison(truth: dict,
                             sc: SlopeComputer,
                             grid,
                             frame_idx: int,
-                            out_dir: Path):
+                            out_dir: Path,
+                            wavelength: float):
     """Compare measured slopes against synthetic ground truth."""
     import matplotlib.pyplot as plt
 
-    sx_truth_2d = truth["sx_truth"][frame_idx]   # [n_sa_y, n_sa_x]
+    sx_truth_2d = truth["sx_truth"][frame_idx]   # [n_sa_y, n_sa_x]  rad/m
     sy_truth_2d = truth["sy_truth"][frame_idx]
 
     sr = slope_result
@@ -370,9 +428,21 @@ def _plot_truth_comparison(truth: dict,
         sx_frame, sy_frame, v_frame, grid
     )
 
-    # Convert truth to rad (it's in rad/m, multiply by lenslet_size)
-    sx_truth_rad = sx_truth_2d * sc.lenslet_size
-    sy_truth_rad = sy_truth_2d * sc.lenslet_size
+    # ── FIX ──────────────────────────────────────────────────────────────
+    # sx_truth/sy_truth are d(phase)/dx in [rad/m]. SlopeComputer's measured
+    # slope is the physical wavefront TILT ANGLE in radians:
+    #     theta = (wavelength / 2*pi) * d(phase)/dx
+    # This is the same conversion used by generate_turbulence.py's
+    # render_shwfs_frame() to produce the pixel displacement in the first
+    # place, so it is the correct, self-consistent factor to invert.
+    # The previous version used `sx_truth_2d * sc.lenslet_size`, which is
+    # off by ~3 orders of magnitude (lenslet_size=300um vs wavelength/2pi
+    # ~0.1um) — that was the entire cause of the huge truth/measured
+    # mismatch.
+    tilt_conv = wavelength / (2.0 * np.pi)
+    sx_truth_rad = sx_truth_2d * tilt_conv
+    sy_truth_rad = sy_truth_2d * tilt_conv
+    # ─────────────────────────────────────────────────────────────────────
 
     mask = grid.valid.reshape(grid.n_sa_y, grid.n_sa_x) & ~np.isnan(sx_meas_2d)
 
@@ -412,8 +482,7 @@ def _plot_truth_comparison(truth: dict,
     fig.savefig(str(out_dir / "truth_comparison.png"),
                 dpi=150, bbox_inches="tight")
     log.info("  ✓ truth_comparison.png")
-    import matplotlib.pyplot as plt_close
-    plt_close.close(fig)
+    plt.close(fig)
 
 
 def step7_save_results(centroid_result: dict,
@@ -510,7 +579,7 @@ def main():
 
     # ── Step 3: Algorithm benchmark ──────────────────────────────────────────
     bench_results, _ = step3_benchmark(
-        frames_f, grid, params, out_dir
+        frames_f, grid, params, out_dir, truth
     )
 
     # ── Step 4: Full centroiding ─────────────────────────────────────────────
@@ -548,7 +617,7 @@ def main():
     print(f"║  Results saved to    : {str(save_path.name):<33}║")
     print("╚" + "═" * 58 + "╝")
     print(f"\nNext: run Stage 2 (wavefront reconstruction) using:")
-    print(f"      outputs/plots/stage1_results.npz  →  src/python/wavefront_reconstructor.py")
+    print(f"      python run_stage2.py")
 
 
 if __name__ == "__main__":
