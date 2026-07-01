@@ -22,25 +22,31 @@ Physical conventions
 * All phases are in **radians** (optical path in nm can be recovered
   by multiplying by wavelength/(2*pi)).
 * Slopes ``s_x, s_y`` entering this module are already in **radians
-  of wavefront tilt** (output of SlopeComputer, Stage 1).
+  of wavefront tilt** (output of SlopeComputer, Stage 1):
+      s_tilt = pixel_displacement * pixel_size / focal_length   [rad]
 * Zernike polynomials are normalised in the Noll (1976) convention
   over a unit circle (orthonormal: integral over unit disk = pi).
 * Piston (j=1) is always excluded — SH-WFS cannot sense it.
 
-Design notes
-------------
-* Reconstructor matrices are precomputed once (``calibrate()``) and
-  stored as ``.npy`` binaries so Stage 2 can be run without regenerating
-  them.
-* SVD-based pseudo-inverse is used for both methods, with a tunable
-  singular-value threshold.
-* Modal reconstruction uses an analytic interaction matrix (Zernike
-  gradients evaluated at sub-aperture centres) — no calibration frames
-  needed.
-* Zonal reconstruction uses the sparse Fried geometry matrix A which
-  maps wavefront node differences to sub-aperture slope averages.
-* A ``WavefrontResult`` dataclass encapsulates all per-frame outputs and
-  is the data contract passed to Stage 3.
+Unit-scaling note (key correction relative to initial implementation)
+----------------------------------------------------------------------
+The interaction matrix D is built from Zernike gradients dZ/dξ evaluated
+in normalised pupil coordinates ξ = x_phys / R_pupil.  The measured SH-WFS
+slope is a *tilt angle* in radians:
+
+    s_tilt  =  (λ / 2π)  ×  (1 / R_pupil)  ×  dZ/dξ     [rad]
+
+where λ/(2π) converts from phase-gradient units (rad/m) to angle (rad).
+Without this factor, the reconstructor under-estimates the wavefront by
+R_pupil / (λ/2π) ≈ 30,000× for typical lab optics.
+
+Fix: scale D by (λ/2π)/R_pupil after construction; scale Ddag by
+R_pupil/(λ/2π) so that  a_hat = Ddag @ s_tilt  gives coefficients in
+radians.  (For a scalar α: (αA)^+ = (1/α) A^+.)
+
+The same correction applies to the zonal Fried matrix: the matrix
+relates *phase differences* (rad) to *tilt angles* (rad), so every
+element must be scaled by (λ/2π).
 
 References
 ----------
@@ -93,6 +99,10 @@ class WavefrontResult:
     pupil_mask   : bool  [H_recon, W_recon] — True inside pupil.
     strehl_estimate : float32 [N_frames]
                   Maréchal approximation: S ≈ exp(−σ²_φ).
+                  NOTE: this approximation is only valid for σ_φ << 1 rad.
+                  For strong turbulence (r0 << D) σ_φ >> 1 and Strehl → 0,
+                  which is physically correct but means the number is not
+                  a useful quality metric.
     """
     phase_maps:       np.ndarray          # [N, H, W]  float32
     zernike_coeffs:   Optional[np.ndarray]  # [N, J]  float32 or None
@@ -126,7 +136,8 @@ class WavefrontResult:
             f"  Frames         : {self.n_frames}\n"
             f"  Modes / nodes  : {self.n_modes}\n"
             f"  RMS WFE        : {rms.mean()*1e3:.2f} ± {rms.std()*1e3:.2f} mrad\n"
-            f"  Strehl (mean)  : {sr.mean():.3f}\n"
+            f"  Strehl (mean)  : {sr.mean():.4f}  "
+            f"(Maréchal; valid only for σ_φ << 1 rad)\n"
             f"  Slope residual : {self.residual_rms.mean()*1e3:.2f} mrad (mean)\n"
         )
 
@@ -314,10 +325,12 @@ class ModalReconstructor:
 
     D is constructed analytically from the partial derivatives of each
     Zernike evaluated at the sub-aperture centre positions, normalised
-    to the pupil radius.
+    to the pupil radius, then scaled by the physical factor (λ/2π)/R_pupil
+    so that the units of D, Ddag, and all slope/coefficient vectors are
+    self-consistently in radians.
 
     After calibration:
-        ``self.D``   [2*N_sa, J]   interaction matrix
+        ``self.D``   [2*N_sa, J]   interaction matrix  (rad → rad)
         ``self.Ddag``[J, 2*N_sa]   pseudo-inverse (reconstructor)
 
     Parameters
@@ -346,6 +359,7 @@ class ModalReconstructor:
         self.Ddag: Optional[np.ndarray] = None  # [J, 2*N_sa]
         self._zernike_map:  Optional[np.ndarray] = None  # [J, H, W]
         self._output_pupil: Optional[np.ndarray] = None  # [H, W] bool
+        self._unit_scale:   float = 1.0  # (λ/2π)/R_pupil applied to D
 
         # Stored after calibrate()
         self._n_sa_valid: int = 0
@@ -358,7 +372,9 @@ class ModalReconstructor:
                   sa_cx_norm: np.ndarray,
                   sa_cy_norm: np.ndarray,
                   valid_mask: np.ndarray,
-                  pupil_radius_px: float = 1.0):
+                  pupil_radius_px: float = 1.0,
+                  wavelength_m: float = 633e-9,
+                  pupil_radius_m: float = 3e-3):
         """
         Build the interaction matrix D from sub-aperture centre positions.
 
@@ -372,6 +388,11 @@ class ModalReconstructor:
             True for sub-apertures inside the pupil.
         pupil_radius_px : float
             Pupil radius in pixels (kept for phase-map evaluation).
+        wavelength_m : float
+            Sensing wavelength [m].  Required for physical unit scaling.
+        pupil_radius_m : float
+            Physical pupil radius [m].  Required for unit scaling.
+            Set to aperture_diameter / 2.
         """
         x = sa_cx_norm[valid_mask]
         y = sa_cy_norm[valid_mask]
@@ -391,9 +412,21 @@ class ModalReconstructor:
             D[:N, k] = dZx           # x-slope block
             D[N:, k] = dZy           # y-slope block
 
-        self.D = D.astype(np.float32)
+        # ── Physical unit scaling ─────────────────────────────────────────────
+        # The raw D contains dZ/dξ in normalised coordinates (dimensionless).
+        # Measured slopes are tilt angles [rad]:
+        #     s_tilt = (λ/2π) / R_pupil_m  ×  dZ/dξ
+        # Scale D by this factor so that  s_tilt = D_scaled @ a  is in radians,
+        # and a_hat = Ddag_scaled @ s_tilt  gives Zernike coefficients in radians.
+        # Since (αA)^+ = (1/α) A^+, Ddag scales by the inverse.
+        _scale = (wavelength_m / (2.0 * math.pi)) / pupil_radius_m
+        self._unit_scale = _scale
+        log.info("  Unit scale (λ/2π)/R_pupil = %.4e  "
+                 "(λ=%.1f nm, R_pupil=%.4f m)",
+                 _scale, wavelength_m * 1e9, pupil_radius_m)
 
-        # SVD pseudo-inverse
+        # SVD pseudo-inverse (computed on UN-scaled D for numerical stability;
+        # scaling is applied analytically after)
         U, sv, Vt = svd(D, full_matrices=False)
         self._singular_values = sv
         self._condition_number = float(sv[0] / sv[-1]) if sv[-1] > 0 else np.inf
@@ -402,8 +435,9 @@ class ModalReconstructor:
         sv_inv    = np.where(sv > threshold, 1.0 / sv, 0.0)
         n_kept    = int((sv > threshold).sum())
 
-        self.Ddag = (Vt.T * sv_inv) @ U.T   # [J, 2*N_sa]
-        self.Ddag = self.Ddag.astype(np.float32)
+        # Apply scale: D_new = _scale * D,  Ddag_new = (1/_scale) * Ddag_old
+        self.D    = (D * _scale).astype(np.float32)
+        self.Ddag = ((Vt.T * sv_inv) @ U.T / _scale).astype(np.float32)
 
         log.info("  Singular values: min=%.3e  max=%.3e  condition=%.2e",
                  sv[-1], sv[0], self._condition_number)
@@ -524,6 +558,8 @@ class ModalReconstructor:
             residual_rms[i] = float(np.sqrt(np.mean(sr**2)))
 
             # Maréchal Strehl estimate: S ≈ exp(−σ²_φ) over pupil
+            # Valid only for σ_φ << 1 rad. For strong turbulence this
+            # will correctly approach zero.
             phi_pupil = pm[self._output_pupil]
             phi_pupil -= phi_pupil.mean()   # remove piston
             sigma2    = float(np.mean(phi_pupil**2))
@@ -532,6 +568,15 @@ class ModalReconstructor:
         log.info("Modal reconstruction complete: %d frames, "
                  "mean residual RMS = %.2e rad",
                  n_frames, residual_rms.mean())
+
+        # Warn if Strehl is uniformly near 1 or uniformly near 0
+        mean_sr = float(strehl.mean())
+        if mean_sr > 0.99:
+            log.warning("Mean Strehl = %.4f ≈ 1.0 — phase amplitude may be "
+                        "too small (check unit scaling).", mean_sr)
+        elif mean_sr < 1e-6:
+            log.info("Mean Strehl ≈ 0 (strong turbulence, D/r0 >> 1 — "
+                     "physically expected).")
 
         return WavefrontResult(
             phase_maps      = phase_maps,
@@ -550,14 +595,15 @@ class ModalReconstructor:
         """Save calibrated reconstructor matrices to a .npz file."""
         np.savez_compressed(
             str(path),
-            D            = self.D,
-            Ddag         = self.Ddag,
-            zernike_map  = self._zernike_map,
-            output_pupil = self._output_pupil,
+            D               = self.D,
+            Ddag            = self.Ddag,
+            zernike_map     = self._zernike_map,
+            output_pupil    = self._output_pupil,
             singular_values = self._singular_values,
-            n_modes      = np.array([self.n_modes]),
-            svd_threshold= np.array([self.svd_threshold]),
-            output_grid_px = np.array([self.output_grid_px]),
+            n_modes         = np.array([self.n_modes]),
+            svd_threshold   = np.array([self.svd_threshold]),
+            output_grid_px  = np.array([self.output_grid_px]),
+            unit_scale      = np.array([self._unit_scale]),
         )
         log.info("Saved modal reconstructor to %s", path)
 
@@ -575,6 +621,8 @@ class ModalReconstructor:
         obj._zernike_map    = data["zernike_map"]
         obj._output_pupil   = data["output_pupil"].astype(bool)
         obj._singular_values = data["singular_values"]
+        # Backward-compatible: older saves may not have unit_scale
+        obj._unit_scale = float(data["unit_scale"][0]) if "unit_scale" in data else 1.0
         log.info("Loaded modal reconstructor from %s  (%d modes)",
                  path, obj.n_modes)
         return obj
@@ -602,19 +650,23 @@ class ZonalReconstructor:
         sx[j,i] = ( (phi[j,i+1]  − phi[j,i])
                    +(phi[j+1,i+1]− phi[j+1,i]) ) / (2 * d_sa)
 
-    This gives the least-squares system  A Φ = s  solved via the
-    sparse SVD pseudo-inverse (LSQR).
+    The slopes measured by the SH-WFS are tilt angles in radians, not
+    phase gradients in rad/m.  The conversion is:
 
-    The piston null space is removed by pinning the mean of in-pupil
-    nodes to zero (removes the single-dimensional null space of A).
+        s_tilt [rad] = (λ/2π) × (phi_{+1} − phi) / d_sa  [rad/m × m/rad × rad]
+
+    So every element of the Fried matrix A must be multiplied by λ/(2π)
+    to match the units of the measured slope vector.  The piston null
+    space is removed by pinning the mean of in-pupil nodes to zero.
 
     Parameters
     ----------
     n_sa_x, n_sa_y : int
         Number of sub-apertures in each direction.
     d_sa : float
-        Physical sub-aperture size [m].  Used to convert slopes [rad]
-        to phase differences [rad·m / m = rad].
+        Physical sub-aperture size [m].
+        Use aperture_diameter / n_sa_x, NOT the lenslet_size config value
+        (which can be inconsistent with the aperture geometry).
     svd_threshold : float
         Singular value truncation fraction for the dense SVD fallback.
         The default LSQR solver ignores this.
@@ -649,14 +701,28 @@ class ZonalReconstructor:
 
     # ── Calibration ──────────────────────────────────────────────────────────
 
-    def calibrate(self, pupil_sa_mask: np.ndarray):
+    def calibrate(self, pupil_sa_mask: np.ndarray,
+                  wavelength_m: float = 633e-9):
         """
-        Build the Fried geometry matrix A.
+        Build the Fried geometry matrix A, scaled for tilt-angle slopes.
 
         Parameters
         ----------
         pupil_sa_mask : bool [n_sa_y, n_sa_x]
             True for sub-apertures inside the pupil.
+        wavelength_m : float
+            Sensing wavelength [m].  Required for unit scaling so that
+            the matrix equation  A @ phi = s_tilt  is in radians.
+
+        Unit-scaling note
+        -----------------
+        The raw Fried matrix A_raw has entries ±1/(2*d_sa) such that:
+            A_raw @ phi [rad]  →  slopes in [rad/m]  (phase gradients).
+        Measured slopes are tilt angles:
+            s_tilt = (λ/2π) × (phase gradient)
+        Therefore:  A_scaled = (λ/2π) × A_raw
+        So that:    A_scaled @ phi = s_tilt   (both in radians).
+        The LSQR solve then correctly recovers phi in radians.
         """
         Nx  = self.n_sa_x
         Ny  = self.n_sa_y
@@ -671,11 +737,14 @@ class ZonalReconstructor:
         log.info("ZonalReconstructor: building Fried matrix "
                  "[%d × %d] for %dx%d SA grid  (%d valid SAs)",
                  n_meas, Nn, Nx, Ny, n_valid)
+        log.info("  d_sa = %.4e m   λ = %.1f nm   λ/(2π) = %.4e",
+                 self.d_sa, wavelength_m * 1e9,
+                 wavelength_m / (2.0 * math.pi))
 
         # Build sparse matrix row by row
         A_sp = lil_matrix((n_meas, Nn), dtype=np.float64)
 
-        row_x = 0   # row index for x-slopes
+        row_x = 0         # row index for x-slopes
         row_y = n_valid   # row index for y-slopes (stacked below x-slopes)
 
         scale = 1.0 / (2.0 * self.d_sa)
@@ -686,9 +755,6 @@ class ZonalReconstructor:
                     continue
 
                 # Node indices at the four corners of sub-aperture (ii, jj)
-                # Corner layout:
-                #   (jj,   ii)  (jj,   ii+1)
-                #   (jj+1, ii)  (jj+1, ii+1)
                 def nidx(r, c): return r * NNx + c
 
                 n00 = nidx(jj,   ii)
@@ -713,8 +779,13 @@ class ZonalReconstructor:
                 row_x += 1
                 row_y += 1
 
-        # Convert to CSR for efficient arithmetic
-        A_csr = A_sp.tocsr()
+        # ── Unit scaling ──────────────────────────────────────────────────────
+        # A_sp currently maps phase [rad] → phase-gradient [rad/m].
+        # Multiply by (λ/2π) to map phase [rad] → tilt-angle [rad],
+        # matching the measured slope units from SlopeComputer.
+        lam_scale = wavelength_m / (2.0 * math.pi)
+        A_csr = A_sp.tocsr() * lam_scale
+
         self.A = A_csr.toarray().astype(np.float32)
 
         # Pupil node mask: a node is "in-pupil" if any adjacent SA is valid
@@ -757,7 +828,7 @@ class ZonalReconstructor:
 
         Returns
         -------
-        phi_2d   : float32 [n_sa_y+1, n_sa_x+1]  phase at node grid
+        phi_2d   : float32 [n_sa_y+1, n_sa_x+1]  phase at node grid [rad]
         slope_resid : float [2*N_sa_valid]
         """
         assert self.A is not None, "Call calibrate() first"
@@ -814,6 +885,14 @@ class ZonalReconstructor:
         log.info("Zonal reconstruction complete: %d frames, "
                  "mean residual RMS = %.2e rad",
                  n_frames, residual_rms.mean())
+
+        mean_sr = float(strehl.mean())
+        if mean_sr > 0.99:
+            log.warning("Mean Strehl = %.4f ≈ 1.0 — phase amplitude may be "
+                        "too small (check unit scaling).", mean_sr)
+        elif mean_sr < 1e-6:
+            log.info("Mean Strehl ≈ 0 (strong turbulence, D/r0 >> 1 — "
+                     "physically expected).")
 
         return WavefrontResult(
             phase_maps      = phase_maps,
